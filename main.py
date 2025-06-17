@@ -13,7 +13,7 @@ def home():
 @app.route('/random')
 def random_image():
     headers = {'User-Agent': 'Mozilla/5.0'}
-    page = requests.get('https://sora.chatgpt.com/explore', headers=headers)
+    page = requests.get('https://sora.chatgpt.com/', headers=headers)
     soup = BeautifulSoup(page.text, 'html.parser')
 
     img_tags = soup.find_all('img')
