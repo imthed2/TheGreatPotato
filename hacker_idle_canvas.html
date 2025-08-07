@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Hacker Idle — Canvas Clicker</title>
+<style>
+  html, body { height: 100%; margin: 0; background: #020402; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  /* Fallback font stack to look "terminal" */
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(() => {
+  'use strict';
+
+  // ====== Helpers ======
+  const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+  const lerp = (a, b, t) => a + (b - a) * t;
+  const now = () => performance.now();
+
+  // ====== Game State ======
+  const state = {
+    data: 0,                 // main currency: "Data"
+    totalData: 0,
+    clickPower: 1,
+    clickBase: 1,
+    dps: 0,
+    prestigeKeys: 0,         // "CryptKeys" permanent
+    prestigeMult: 1,         // computed from crypt keys
+    upgrades: [],            // filled later
+    logs: [],
+    particles: [],
+    lastTime: now(),
+    lastSave: Date.now(),
+    startReal: Date.now(),
+    glitch: 0,
+    scroll: 0,               // vertical scroll for the sidebar
+    version: 1,
+  };
+
+  // Fonts & Theme
+  const theme = {
+    bg: '#020402',
+    grid: 'rgba(16,64,16,0.25)',
+    text: '#b6ffb6',
+    dim: '#5eff5e',
+    accent: '#00ff88',
+    warn: '#ff5e5e',
+    danger: '#ff3355',
+    shadow: 'rgba(0,0,0,0.5)',
+    font: '12px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace'
+  };
+
+  // Upgrade blueprints
+  const shop = [
+    // name, baseCost, costScale, dps, type
+    { id:'script',   name:'Script Kiddie',    desc:'+0.5 Data/s', base: 15,   scale: 1.15, dps: 0.5,  kind:'gen' },
+    { id:'backdoor', name:'Backdoor',         desc:'+4 Data/s',   base: 120,  scale: 1.15, dps: 4,    kind:'gen' },
+    { id:'botnet',   name:'Botnet',           desc:'+20 Data/s',  base: 750,  scale: 1.16, dps: 20,   kind:'gen' },
+    { id:'miner',    name:'Crypto Miner',     desc:'+95 Data/s',  base: 4000, scale: 1.18, dps: 95,   kind:'gen' },
+    { id:'zeroday',  name:'Zero‑Day Farm',    desc:'+420 Data/s', base: 20000,scale: 1.20, dps: 420,  kind:'gen' },
+    // click upgrades
+    { id:'overclock',name:'Overclock',        desc:'Click +1',    base: 25,   scale: 1.35, dps: 0,    kind:'click', addClick: 1 },
+    { id:'macro',    name:'Click Macro',      desc:'Click +5',    base: 300,  scale: 1.40, dps: 0,    kind:'click', addClick: 5 },
+    { id:'aimbot',   name:'Aimbot',           desc:'Click +20',   base: 2200, scale: 1.42, dps: 0,    kind:'click', addClick: 20 },
+  ];
+
+  // Build runtime upgrade objects
+  state.upgrades = shop.map(s => ({
+    ...s, level: 0, cost: s.base
+  }));
+
+  // Prestige helper
+  function prestigeMultiplier(keys) {
+    // diminishing returns, always useful
+    return 1 + Math.sqrt(keys);
+  }
+  state.prestigeMult = prestigeMultiplier(state.prestigeKeys);
+
+  // ====== Canvas Setup ======
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  let W = 0, H = 0;
+  function resize() {
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    canvas.width = Math.floor(window.innerWidth * dpr);
+    canvas.height = Math.floor(window.innerHeight * dpr);
+    canvas.style.width = '100vw';
+    canvas.style.height = '100vh';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    W = window.innerWidth; H = window.innerHeight;
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ====== Input ======
+  const input = { mx:0, my:0, down:false, clicked:false, wheel:0 };
+  canvas.addEventListener('mousemove', e => { input.mx = e.offsetX; input.my = e.offsetY; });
+  canvas.addEventListener('mousedown', e => { input.down = true; });
+  canvas.addEventListener('mouseup',   e => { input.down = false; input.clicked = true; });
+  canvas.addEventListener('wheel', e => {
+    state.scroll = clamp(state.scroll + (e.deltaY > 0 ? 40 : -40), 0, Math.max(0, state.upgrades.length * 64 - (H - 120)));
+  }, { passive:true });
+
+  // Keyboard: Space to hack, numbers to quick buy
+  window.addEventListener('keydown', e => {
+    if (e.code === 'Space') { doClick(); e.preventDefault(); }
+    if (/Digit[1-9]/.test(e.code)) {
+      const idx = parseInt(e.code.replace('Digit',''),10) - 1;
+      if (state.upgrades[idx]) buyUpgrade(state.upgrades[idx]);
+    }
+    if (e.key === 's' || e.key === 'S') save(true);
+    if (e.key === 'r' || e.key === 'R') attemptPrestige();
+  });
+
+  // ====== Core Mechanics ======
+  function gainData(amount) {
+    amount *= state.prestigeMult;
+    state.data += amount;
+    state.totalData += amount;
+  }
+
+  function doClick() {
+    const amt = state.clickPower * state.prestigeMult;
+    gainData(state.clickPower);
+    addLog(`> Injected payload [+${fmt(amt)} Data]`);
+    burstParticles(input.mx, input.my);
+    state.glitch = Math.min(1, state.glitch + 0.6);
+  }
+
+  function buyUpgrade(u) {
+    if (state.data >= u.cost) {
+      state.data -= u.cost;
+      u.level++;
+      if (u.kind === 'gen') recalcDps();
+      if (u.kind === 'click') state.clickPower += (u.addClick || 0);
+      u.cost = Math.ceil(u.base * Math.pow(u.scale, u.level));
+      addLog(`> Bought ${u.name} [Lv.${u.level}]`);
+      state.glitch = Math.min(1, state.glitch + 0.3);
+      return true;
+    }
+    return false;
+  }
+
+  function recalcDps() {
+    state.dps = state.upgrades.filter(u=>u.kind==='gen')
+                 .reduce((sum,u)=>sum + u.dps * u.level, 0) * state.prestigeMult;
+  }
+
+  // ====== Particles / Flair ======
+  function burstParticles(x, y) {
+    for (let i=0;i<12;i++) {
+      state.particles.push({
+        x, y,
+        vx: (Math.random()*2-1)*2,
+        vy: -Math.random()*3-1,
+        a: 1,
+        life: 600 + Math.random()*300,
+      });
+    }
+  }
+
+  function updateParticles(dt) {
+    for (const p of state.particles) {
+      p.x += p.vx * dt*0.06;
+      p.y += p.vy * dt*0.06;
+      p.vy += 0.004 * dt;
+      p.a -= dt / p.life;
+    }
+    state.particles = state.particles.filter(p=>p.a>0);
+  }
+
+  // ====== Logs ======
+  function addLog(msg) {
+    const t = new Date();
+    const ts = t.toLocaleTimeString();
+    state.logs.unshift(`[${ts}] ${msg}`);
+    if (state.logs.length > 10) state.logs.length = 10;
+  }
+
+  // ====== Save / Load / Offline Progress ======
+  const SAVE_KEY = 'hacker_idle_save_v1';
+  function save(force=false) {
+    const nowT = Date.now();
+    if (!force && (nowT - state.lastSave < 10000)) return; // every 10s
+    state.lastSave = nowT;
+    const payload = {
+      data: state.data, totalData: state.totalData,
+      clickPower: state.clickPower,
+      prestigeKeys: state.prestigeKeys,
+      upgrades: state.upgrades.map(u => ({ id:u.id, level:u.level, cost:u.cost })),
+      timestamp: nowT, version: state.version
+    };
+    localStorage.setItem(SAVE_KEY, JSON.stringify(payload));
+    addLog('> Saved.');
+  }
+
+  function load() {
+    try {
+      const raw = localStorage.getItem(SAVE_KEY);
+      if (!raw) return;
+      const s = JSON.parse(raw);
+      state.data = s.data || 0;
+      state.totalData = s.totalData || 0;
+      state.clickPower = s.clickPower || 1;
+      state.prestigeKeys = s.prestigeKeys || 0;
+      state.prestigeMult = prestigeMultiplier(state.prestigeKeys);
+      // merge upgrades by id
+      if (Array.isArray(s.upgrades)) {
+        for (const u of s.upgrades) {
+          const tgt = state.upgrades.find(x=>x.id===u.id);
+          if (tgt) {
+            tgt.level = u.level||0;
+            tgt.cost = u.cost||tgt.base;
+          }
+        }
+      }
+      recalcDps();
+      // offline progress
+      const dt = Math.max(0, Date.now() - (s.timestamp||Date.now()));
+      const secs = Math.min(60*60*6, Math.floor(dt/1000)); // cap 6h
+      const offlineGain = state.dps * secs;
+      if (offlineGain > 0) {
+        gainData(offlineGain);
+        addLog(`> Offline farming: +${fmt(offlineGain)} Data (${secs}s)`);
+      }
+    } catch (e) {
+      console.warn('Load failed', e);
+    }
+  }
+  load();
+
+  // ====== Prestige ======
+  function prestigeGainPreview() {
+    // Gain = sqrt(totalData/1e6) rounded
+    return Math.floor(Math.sqrt(state.totalData / 1e6));
+  }
+
+  function attemptPrestige() {
+    const can = prestigeGainPreview();
+    if (can <= 0) {
+      addLog('> Need ~1,000,000 total Data for first CryptKey.');
+      return;
+    }
+    // reset soft, grant keys
+    state.prestigeKeys += can;
+    state.prestigeMult = prestigeMultiplier(state.prestigeKeys);
+    state.data = 0;
+    state.totalData = 0;
+    state.clickPower = state.clickBase;
+    for (const u of state.upgrades) { u.level = 0; u.cost = u.base; }
+    recalcDps();
+    addLog(`> System Reboot: +${can} CryptKey(s). Permanent boost active.`);
+    save(true);
+  }
+
+  // ====== Rendering ======
+  function fmt(n) {
+    if (n < 1000) return n.toFixed(0);
+    const units = ['K','M','B','T','Q'];
+    let u = -1;
+    while (n >= 1000 && u < units.length-1) { n/=1000; u++; }
+    return n.toFixed(2) + units[u];
+  }
+
+  function drawGrid() {
+    ctx.save();
+    ctx.strokeStyle = theme.grid;
+    ctx.lineWidth = 1;
+    for (let x=0; x<W; x+=40) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,H); ctx.stroke(); }
+    for (let y=0; y<H; y+=40) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(W,y); ctx.stroke(); }
+    ctx.restore();
+  }
+
+  function drawHeader() {
+    ctx.save();
+    ctx.fillStyle = theme.text;
+    ctx.font = '16px monospace';
+    ctx.shadowColor = theme.shadow; ctx.shadowBlur = 8;
+    const title = 'HACKER IDLE // root@you:~$';
+    ctx.fillText(title, 16 + (Math.random()*state.glitch*4-2), 28);
+    ctx.font = '12px monospace';
+    ctx.fillText('[SPACE]=Hack   [1..8]=Buy   [S]=Save   [R]=Reboot', 16, 48);
+    ctx.restore();
+  }
+
+  function drawStats() {
+    const pad = 12;
+    const barH = 88;
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.fillRect(0,0,W,barH);
+    ctx.fillStyle = theme.text;
+    ctx.font = '20px monospace';
+    ctx.fillText(`Data: ${fmt(state.data)}`, pad, 26);
+    ctx.font = '14px monospace';
+    ctx.fillText(`DPS: ${fmt(state.dps)}  |  Click: ${fmt(state.clickPower * state.prestigeMult)}  |  CryptKeys: ${state.prestigeKeys}  (x${state.prestigeMult.toFixed(2)})`, pad, 48);
+    // Prestige preview on right
+    const gain = prestigeGainPreview();
+    ctx.textAlign = 'right';
+    ctx.fillStyle = gain>0 ? theme.accent : theme.dim;
+    ctx.fillText(`Reboot → +${gain} CryptKey(s) [R]`, W - pad, 26);
+    ctx.textAlign = 'left';
+    ctx.restore();
+  }
+
+  function drawTerminal() {
+    // central clickable area
+    const x = 280, y = 110, w = Math.max(320, W - 560), h = H - 220;
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(x, y, w, h);
+    // scanlines
+    ctx.globalAlpha = 0.12;
+    for (let i=0; i<h; i+=2) {
+      ctx.fillStyle = '#00ff8840';
+      ctx.fillRect(x, y + i, w, 1);
+    }
+    ctx.globalAlpha = 1;
+    // "Hack" button area (center)
+    const bx = x + w*0.5 - 100, by = y + h*0.5 - 40, bw = 200, bh = 80;
+    const hover = input.mx>=bx && input.mx<=bx+bw && input.my>=by && input.my<=by+bh;
+    ctx.fillStyle = hover ? 'rgba(0,255,136,0.25)' : 'rgba(0,255,136,0.1)';
+    ctx.fillRect(bx, by, bw, bh);
+    ctx.strokeStyle = theme.accent;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(bx, by, bw, bh);
+    ctx.fillStyle = theme.text;
+    ctx.font = '18px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('HACK', bx + bw/2 + (Math.random()*state.glitch*2-1), by + bh/2 + 6);
+    ctx.textAlign = 'left';
+
+    // Log panel bottom
+    const ly = y + h - 96;
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(x+8, ly, w-16, 88);
+    ctx.fillStyle = theme.dim;
+    ctx.font = '11px monospace';
+    for (let i=0;i<state.logs.length;i++) {
+      ctx.fillText(state.logs[i], x+16, ly + 18 + i*14);
+    }
+
+    // Particles
+    for (const p of state.particles) {
+      ctx.globalAlpha = Math.max(0, Math.min(1, p.a));
+      ctx.fillStyle = theme.accent;
+      ctx.fillRect(p.x-1, p.y-1, 2, 2);
+    }
+    ctx.globalAlpha = 1;
+
+    // Click handling
+    if (input.clicked && hover) doClick();
+
+    ctx.restore();
+  }
+
+  function drawShop() {
+    // left sidebar
+    const x = 12, y = 100, w = 250, itemH = 64;
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(x-4, y-16, w+8, H - y - 12);
+    ctx.font = '14px monospace';
+    ctx.fillStyle = theme.text;
+    ctx.fillText('Upgrades', x, y-24);
+
+    const startY = y - state.scroll;
+    for (let i=0;i<state.upgrades.length;i++) {
+      const u = state.upgrades[i];
+      const iy = startY + i*itemH;
+      if (iy > H - 80 || iy + itemH < y-16) continue;
+      // card
+      const afford = state.data >= u.cost;
+      ctx.fillStyle = afford ? 'rgba(0,255,136,0.08)' : 'rgba(255,255,255,0.03)';
+      ctx.fillRect(x, iy, w, itemH-8);
+      ctx.strokeStyle = afford ? theme.accent : '#0f3d2f';
+      ctx.strokeRect(x, iy, w, itemH-8);
+
+      // text
+      ctx.fillStyle = theme.text;
+      ctx.font = '13px monospace';
+      ctx.fillText(`${i+1}. ${u.name}  Lv.${u.level}`, x+8, iy+20);
+      ctx.fillStyle = theme.dim;
+      ctx.font = '11px monospace';
+      const d = u.kind==='gen' ? `${u.desc}` : `${u.desc}`;
+      ctx.fillText(d, x+8, iy+36);
+      ctx.fillStyle = afford ? theme.accent : theme.dim;
+      ctx.fillText(`Cost: ${fmt(u.cost)} Data`, x+8, iy+52);
+
+      // buy button area for clicks
+      const bx = x, by = iy, bw = w, bh = itemH-8;
+      const hover = input.mx>=bx && input.mx<=bx+bw && input.my>=by && input.my<=by+bh;
+      if (input.clicked && hover) buyUpgrade(u);
+    }
+
+    ctx.restore();
+  }
+
+  function drawRightPanel() {
+    // right info panel
+    const w = 250, x = W - w - 12, y = 100;
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(x-4, y-16, w+8, H - y - 12);
+    ctx.font = '14px monospace';
+    ctx.fillStyle = theme.text;
+    ctx.fillText('Stats', x, y-24);
+
+    ctx.font = '12px monospace';
+    const lines = [
+      `Playtime: ${fmtTime((Date.now()-state.startReal)/1000)}`,
+      `Total Data: ${fmt(state.totalData)}`,
+      `DPS: ${fmt(state.dps)}`,
+      `Click: ${fmt(state.clickPower * state.prestigeMult)}`,
+      `CryptKeys: ${state.prestigeKeys} (x${state.prestigeMult.toFixed(2)})`,
+      '',
+      'Prestige (Reboot) grants',
+      'CryptKeys based on total',
+      'Data: sqrt(total/1e6).'
+    ];
+    let yy = y;
+    for (const L of lines) {
+      yy += 18;
+      ctx.fillStyle = theme.dim;
+      ctx.fillText(L, x, yy);
+    }
+
+    // Reboot button
+    yy += 18;
+    const bw = w, bh = 44, bx = x, by = yy+8;
+    const can = prestigeGainPreview() > 0;
+    const hover = input.mx>=bx && input.mx<=bx+bw && input.my>=by && input.my<=by+bh;
+    ctx.fillStyle = can ? (hover ? 'rgba(0,255,136,0.2)' : 'rgba(0,255,136,0.1)') : 'rgba(255,255,255,0.05)';
+    ctx.fillRect(bx, by, bw, bh);
+    ctx.strokeStyle = can ? theme.accent : theme.dim;
+    ctx.strokeRect(bx, by, bw, bh);
+    ctx.fillStyle = can ? theme.accent : theme.dim;
+    ctx.font = '13px monospace';
+    ctx.fillText(`REBOOT SYSTEM [+${prestigeGainPreview()} CryptKeys]`, x+8, by+28);
+    if (input.clicked && hover && can) attemptPrestige();
+
+    ctx.restore();
+  }
+
+  function fmtTime(s) {
+    s = Math.floor(s);
+    const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+    return `${h}h ${m}m ${sec}s`;
+  }
+
+  // ====== Main Loop ======
+  function update() {
+    const t = now();
+    const dt = Math.min(100, t - state.lastTime); // cap
+    state.lastTime = t;
+
+    // passive gain
+    if (state.dps > 0) {
+      gainData(state.dps * (dt/1000));
+    }
+
+    // decay glitch
+    state.glitch = Math.max(0, state.glitch - dt/1200);
+
+    // particles
+    updateParticles(dt);
+
+    // autosave
+    save(false);
+
+    // reset one-frame click flag
+    input.clicked = false;
+  }
+
+  function render() {
+    // clear
+    ctx.fillStyle = theme.bg;
+    ctx.fillRect(0,0,W,H);
+
+    drawGrid();
+    drawHeader();
+    drawStats();
+    drawShop();
+    drawTerminal();
+    drawRightPanel();
+  }
+
+  function loop() {
+    update();
+    render();
+    requestAnimationFrame(loop);
+  }
+  addLog('> Connected to dark‑net relay.');
+  addLog('> Hold SPACE to click faster.');
+  loop();
+
+  // Safety: Save on unload
+  window.addEventListener('beforeunload', () => save(true));
+})();
+</script>
+</body>
+</html>
